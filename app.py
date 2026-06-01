@@ -43,26 +43,20 @@ def save_threshold(value):
     with open(THRESHOLD_FILE, 'w') as f:
         f.write(str(value))
 
-async def fetch_with_retry(session, url, retries=3):
-    """Пытается получить данные с повторными попытками"""
-    for attempt in range(retries):
-        try:
-            async with session.get(url, timeout=15) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    logging.warning(f"Attempt {attempt+1}: HTTP {response.status} for {url}")
-        except asyncio.TimeoutError:
-            logging.warning(f"Attempt {attempt+1}: Timeout for {url}")
-        except Exception as e:
-            logging.warning(f"Attempt {attempt+1}: {e} for {url}")
-        
-        if attempt < retries - 1:
-            await asyncio.sleep(2)
-    return None
+async def fetch_json(session, url):
+    try:
+        async with session.get(url, timeout=15) as response:
+            if response.status == 200:
+                return await response.json()
+            else:
+                logging.warning(f"HTTP {response.status} for {url}")
+                return None
+    except Exception as e:
+        logging.warning(f"Error for {url}: {e}")
+        return None
 
 async def get_prices():
-    """Получает цены с Bybit и Bitget"""
+    """Получает цены с Bybit, Bitget, OKX, Gate"""
     connector = aiohttp.TCPConnector(
         resolver=aiohttp.resolver.AsyncResolver(nameservers=["8.8.8.8", "8.8.4.4"])
     )
@@ -70,8 +64,7 @@ async def get_prices():
         prices = {}
         
         # ---- Bybit ----
-        bybit_url = "https://api.bybit.com/v5/market/tickers?category=linear"
-        data = await fetch_with_retry(session, bybit_url)
+        data = await fetch_json(session, "https://api.bybit.com/v5/market/tickers?category=linear")
         if data and data.get('retCode') == 0:
             for item in data['result']['list']:
                 symbol = item['symbol']
@@ -83,8 +76,7 @@ async def get_prices():
                         pass
         
         # ---- Bitget ----
-        bitget_url = "https://api.bitget.com/api/v2/mix/market/tickers?productType=umcbl"
-        data = await fetch_with_retry(session, bitget_url)
+        data = await fetch_json(session, "https://api.bitget.com/api/v2/mix/market/tickers?productType=umcbl")
         if data and data.get('code') == '00000':
             for item in data['data']:
                 symbol = item['symbol']
@@ -95,11 +87,35 @@ async def get_prices():
                     except (ValueError, TypeError):
                         pass
         
+        # ---- OKX (свопы) ----
+        data = await fetch_json(session, "https://www.okx.com/api/v5/market/tickers?instType=SWAP")
+        if data and data.get('code') == '0':
+            for item in data['data']:
+                symbol = item.get('instId', '')
+                if symbol.endswith('-USDT-SWAP'):
+                    coin = symbol.replace('-USDT-SWAP', '')
+                    try:
+                        prices[f"okx_{coin}"] = float(item['last'])
+                    except (ValueError, TypeError):
+                        pass
+        
+        # ---- Gate (фьючерсы) ----
+        data = await fetch_json(session, "https://api.gateio.ws/api/v4/futures/usdt/tickers")
+        if data and isinstance(data, list):
+            for item in data:
+                symbol = item.get('contract', '')
+                if symbol.endswith('_USDT'):
+                    coin = symbol.replace('_USDT', '')
+                    try:
+                        prices[f"gate_{coin}"] = float(item['last'])
+                    except (ValueError, TypeError):
+                        pass
+        
         logging.info(f"Получено цен: {len(prices)}")
         return prices
 
 def analyze(prices):
-    """Анализирует отклонения"""
+    """Анализирует отклонения между всеми парами бирж"""
     coins = defaultdict(dict)
     for key, price in prices.items():
         ex, coin = key.split('_', 1)
@@ -110,38 +126,49 @@ def analyze(prices):
     threshold = load_threshold()
     
     for coin, exchanges in coins.items():
-        if 'bybit' in exchanges and 'bitget' in exchanges:
-            ratio = (exchanges['bybit'] / exchanges['bitget']) * 1000
-            price_history[coin].append((now, ratio))
-            cutoff = now - timedelta(hours=1)
-            price_history[coin] = [(t, r) for t, r in price_history[coin] if t > cutoff]
-            
-            if len(price_history[coin]) >= 3:
-                avg = sum(r for _, r in price_history[coin]) / len(price_history[coin])
-                deviation = abs(ratio - avg) / avg * 100
-                last = last_alert_time.get(coin)
-                if deviation >= threshold and (last is None or (now - last) > timedelta(seconds=SIGNAL_COOLDOWN)):
-                    results.append({
-                        'coin': coin,
-                        'deviation': deviation,
-                        'ratio': ratio,
-                        'avg': avg,
-                        'bybit': exchanges['bybit'],
-                        'bitget': exchanges['bitget'],
-                        'time': now
-                    })
+        if len(exchanges) < 2:
+            continue
+        
+        # Берём первую пару бирж для анализа (можно расширить)
+        ex_list = list(exchanges.keys())
+        for i in range(len(ex_list)):
+            for j in range(i+1, len(ex_list)):
+                ex1, ex2 = ex_list[i], ex_list[j]
+                price1, price2 = exchanges[ex1], exchanges[ex2]
+                if price1 and price2 and price1 > 0 and price2 > 0:
+                    ratio = (price1 / price2) * 1000
+                    key = f"{coin}_{ex1}_{ex2}"
+                    price_history[key].append((now, ratio))
+                    cutoff = now - timedelta(hours=1)
+                    price_history[key] = [(t, r) for t, r in price_history[key] if t > cutoff]
+                    
+                    if len(price_history[key]) >= 3:
+                        avg = sum(r for _, r in price_history[key]) / len(price_history[key])
+                        deviation = abs(ratio - avg) / avg * 100
+                        last = last_alert_time.get(key)
+                        if deviation >= threshold and (last is None or (now - last) > timedelta(seconds=SIGNAL_COOLDOWN)):
+                            results.append({
+                                'coin': coin,
+                                'deviation': deviation,
+                                'ex1': ex1,
+                                'ex2': ex2,
+                                'price1': price1,
+                                'price2': price2,
+                                'ratio': ratio,
+                                'avg': avg,
+                                'time': now
+                            })
     return results
 
 # --- КОМАНДЫ ТЕЛЕГРАМА ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        f"🤖 **Арбитражный бот (активный режим)**\n\n"
-        f"Bybit ↔ Bitget\n"
+        f"🤖 **Арбитражный бот (4 биржи)**\n\n"
+        f"Биржи: Bybit, Bitget, OKX, Gate\n"
         f"Порог: {load_threshold()}%\n\n"
         f"/status — проверить рынок\n"
-        f"/threshold X — изменить порог\n\n"
-        f"Бот работает 24/7. Сигналы будут приходить автоматически.",
+        f"/threshold X — изменить порог",
         reply_markup=refresh_btn
     )
 
@@ -150,7 +177,7 @@ async def cmd_status(message: types.Message):
     await message.answer("🔍 Сканирую рынок...", reply_markup=refresh_btn)
     prices = await get_prices()
     if not prices:
-        await message.answer("❌ Не удалось получить данные с бирж. Проверьте интернет.", reply_markup=refresh_btn)
+        await message.answer("❌ Не удалось получить данные с бирж.", reply_markup=refresh_btn)
         return
     
     results = analyze(prices)
@@ -160,7 +187,7 @@ async def cmd_status(message: types.Message):
         text = f"📊 **Найдено сигналов: {len(results)}**\n\n"
         for r in results[:5]:
             text += f"**{r['coin']}**: {r['deviation']:.2f}%\n"
-            text += f"Bybit: {r['bybit']:.6f} | Bitget: {r['bitget']:.6f}\n\n"
+            text += f"{r['ex1'].upper()}: {r['price1']:.6f} | {r['ex2'].upper()}: {r['price2']:.6f}\n\n"
         await message.answer(text, reply_markup=refresh_btn)
 
 @dp.message(Command("threshold"))
@@ -186,26 +213,25 @@ async def refresh_callback(callback: types.CallbackQuery):
 
 # --- ФОНОВОЕ СКАНИРОВАНИЕ ---
 async def background_scanner():
-    """Фоновое сканирование и отправка сигналов"""
     while True:
         try:
-            logging.info("Фоновое сканирование...")
             prices = await get_prices()
             if prices:
                 results = analyze(prices)
                 for r in results:
                     text = (
                         f"⚠️ **СИГНАЛ** {r['deviation']:.2f}%\n\n"
-                        f"{r['coin']}\nBybit: {r['bybit']:.6f}\n"
-                        f"Bitget: {r['bitget']:.6f}\n"
+                        f"{r['coin']}\n"
+                        f"{r['ex1'].upper()}: {r['price1']:.6f}\n"
+                        f"{r['ex2'].upper()}: {r['price2']:.6f}\n"
                         f"Соотношение: {r['ratio']:.2f} (ср. {r['avg']:.2f})"
                     )
                     await bot.send_message(ADMIN_ID, text, reply_markup=refresh_btn)
-                    last_alert_time[r['coin']] = r['time']
-                    logging.info(f"Сигнал для {r['coin']}: {r['deviation']:.2f}%")
+                    last_alert_time[f"{r['coin']}_{r['ex1']}_{r['ex2']}"] = r['time']
+                    logging.info(f"Сигнал: {r['coin']} ({r['ex1']} ↔ {r['ex2']}) - {r['deviation']:.2f}%")
         except Exception as e:
             logging.error(f"Ошибка в фоне: {e}")
-        await asyncio.sleep(60)  # Проверка раз в минуту
+        await asyncio.sleep(60)
 
 # --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 async def health_check(request):
