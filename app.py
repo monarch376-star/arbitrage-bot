@@ -18,7 +18,7 @@ if not TOKEN:
 
 ADMIN_ID = int(os.environ.get("ADMIN_CHAT_ID", 2715781))
 THRESHOLD_FILE = "threshold.txt"
-DEFAULT_THRESHOLD = 0.5
+DEFAULT_THRESHOLD = 1.5  # ИСПРАВЛЕНО: теперь 1.5% по умолчанию
 SIGNAL_COOLDOWN = 60 * 60  # 1 час
 
 # --- ИНИЦИАЛИЗАЦИЯ БОТА ---
@@ -34,6 +34,7 @@ last_alert_time = {}
 logging.basicConfig(level=logging.INFO)
 
 def load_threshold():
+    """Загружает порог из файла"""
     if os.path.exists(THRESHOLD_FILE):
         with open(THRESHOLD_FILE, 'r') as f:
             return float(f.read().strip())
@@ -123,13 +124,12 @@ def analyze(prices):
     
     results = []
     now = datetime.now()
-    threshold = load_threshold()
+    current_threshold = load_threshold()  # ВАЖНО: берём актуальный порог
     
     for coin, exchanges in coins.items():
         if len(exchanges) < 2:
             continue
         
-        # Берём первую пару бирж для анализа (можно расширить)
         ex_list = list(exchanges.keys())
         for i in range(len(ex_list)):
             for j in range(i+1, len(ex_list)):
@@ -146,7 +146,8 @@ def analyze(prices):
                         avg = sum(r for _, r in price_history[key]) / len(price_history[key])
                         deviation = abs(ratio - avg) / avg * 100
                         last = last_alert_time.get(key)
-                        if deviation >= threshold and (last is None or (now - last) > timedelta(seconds=SIGNAL_COOLDOWN)):
+                        # ИСПРАВЛЕНО: теперь deviation сравнивается с current_threshold
+                        if deviation >= current_threshold and (last is None or (now - last) > timedelta(seconds=SIGNAL_COOLDOWN)):
                             results.append({
                                 'coin': coin,
                                 'deviation': deviation,
@@ -166,7 +167,7 @@ async def cmd_start(message: types.Message):
     await message.answer(
         f"🤖 **Арбитражный бот (4 биржи)**\n\n"
         f"Биржи: Bybit, Bitget, OKX, Gate\n"
-        f"Порог: {load_threshold()}%\n\n"
+        f"Текущий порог: {load_threshold()}%\n\n"
         f"/status — проверить рынок\n"
         f"/threshold X — изменить порог",
         reply_markup=refresh_btn
@@ -182,9 +183,9 @@ async def cmd_status(message: types.Message):
     
     results = analyze(prices)
     if not results:
-        await message.answer(f"✅ Отклонений выше порога нет. (Проверено {len(prices)} цен)", reply_markup=refresh_btn)
+        await message.answer(f"✅ Отклонений выше {load_threshold()}% нет. (Проверено {len(prices)} цен)", reply_markup=refresh_btn)
     else:
-        text = f"📊 **Найдено сигналов: {len(results)}**\n\n"
+        text = f"📊 **Найдено сигналов: {len(results)}** (порог {load_threshold()}%)\n\n"
         for r in results[:5]:
             text += f"**{r['coin']}**: {r['deviation']:.2f}%\n"
             text += f"{r['ex1'].upper()}: {r['price1']:.6f} | {r['ex2'].upper()}: {r['price2']:.6f}\n\n"
@@ -202,9 +203,9 @@ async def cmd_threshold(message: types.Message):
             await message.answer("❌ От 0.1% до 10%", reply_markup=refresh_btn)
             return
         save_threshold(val)
-        await message.answer(f"✅ Порог: {val}%", reply_markup=refresh_btn)
+        await message.answer(f"✅ Порог изменён на {val}%\nТеперь сигналы будут приходить только при отклонении ≥ {val}%", reply_markup=refresh_btn)
     except:
-        await message.answer("❌ Используйте: `/threshold 0.7`", reply_markup=refresh_btn)
+        await message.answer("❌ Используйте: `/threshold 1.5`", reply_markup=refresh_btn)
 
 @dp.callback_query(lambda c: c.data == "refresh")
 async def refresh_callback(callback: types.CallbackQuery):
@@ -215,23 +216,27 @@ async def refresh_callback(callback: types.CallbackQuery):
 async def background_scanner():
     while True:
         try:
+            current_threshold = load_threshold()  # ИСПРАВЛЕНО: каждый раз загружаем актуальный порог
             prices = await get_prices()
             if prices:
                 results = analyze(prices)
                 for r in results:
-                    text = (
-                        f"⚠️ **СИГНАЛ** {r['deviation']:.2f}%\n\n"
-                        f"{r['coin']}\n"
-                        f"{r['ex1'].upper()}: {r['price1']:.6f}\n"
-                        f"{r['ex2'].upper()}: {r['price2']:.6f}\n"
-                        f"Соотношение: {r['ratio']:.2f} (ср. {r['avg']:.2f})"
-                    )
-                    await bot.send_message(ADMIN_ID, text, reply_markup=refresh_btn)
-                    last_alert_time[f"{r['coin']}_{r['ex1']}_{r['ex2']}"] = r['time']
-                    logging.info(f"Сигнал: {r['coin']} ({r['ex1']} ↔ {r['ex2']}) - {r['deviation']:.2f}%")
+                    # Дополнительная проверка, что отклонение всё ещё >= порога
+                    if r['deviation'] >= current_threshold:
+                        text = (
+                            f"⚠️ **СИГНАЛ** {r['deviation']:.2f}%\n\n"
+                            f"{r['coin']}\n"
+                            f"{r['ex1'].upper()}: {r['price1']:.6f}\n"
+                            f"{r['ex2'].upper()}: {r['price2']:.6f}\n"
+                            f"Соотношение: {r['ratio']:.2f} (ср. {r['avg']:.2f})\n"
+                            f"Порог: {current_threshold}%"
+                        )
+                        await bot.send_message(ADMIN_ID, text, reply_markup=refresh_btn)
+                        last_alert_time[f"{r['coin']}_{r['ex1']}_{r['ex2']}"] = r['time']
+                        logging.info(f"Сигнал: {r['coin']} ({r['ex1']} ↔ {r['ex2']}) - {r['deviation']:.2f}%")
         except Exception as e:
             logging.error(f"Ошибка в фоне: {e}")
-        await asyncio.sleep(60)
+        await asyncio.sleep(60)  # 1 минута
 
 # --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 async def health_check(request):
